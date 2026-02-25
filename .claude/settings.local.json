@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /e/Projects/autoclicker/src-tauri/capabilities/ && cat /e/Projects/autoclicker/src-tauri/capabilities/*.json 2>/dev/null)",
+      "Bash(grep:*)",
+      "Bash(tail:*)"
+    ]
+  }
+}

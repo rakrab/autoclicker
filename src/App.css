@@ -1,0 +1,87 @@
+@import "tailwindcss";
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg:           #08080f;
+  --surface:      #0f0f1c;
+  --surface-2:    #161628;
+  --border:       rgba(255, 255, 255, 0.07);
+  --border-focus: rgba(124, 58, 237, 0.55);
+  --accent:       #7c3aed;
+  --accent-mid:   #8b5cf6;
+  --accent-light: #a78bfa;
+  --text:         #ededfa;
+  --text-2:       rgba(237, 237, 250, 0.45);
+  --text-3:       rgba(237, 237, 250, 0.22);
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Outfit', system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Allow text selection inside inputs */
+input {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Remove number input spinners */
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type='number'] {
+  -moz-appearance: textfield;
+}
+
+/* Global focus reset */
+*:focus {
+  outline: none;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(124, 58, 237, 0.3);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(124, 58, 237, 0.55);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+
+/* Mouse icon glow when action is active */
+@keyframes glow-breathe {
+  0%, 100% { box-shadow: 0 0 14px rgba(124, 58, 237, 0.45), 0 0 0 1px rgba(124, 58, 237, 0.35); }
+  50%       { box-shadow: 0 0 28px rgba(139, 92, 246, 0.75), 0 0 0 1px rgba(139, 92, 246, 0.55); }
+}
