@@ -11,7 +11,7 @@
 - Left Click (LMB) and Right Click (RMB)
 - Delay in CPS, ms, seconds or minutes
 - Support for Keystrokes
-- Support for Key Combination
+- Support for Key Combinations
 - Support for Sequences
 
 ## 👁️ Preview
