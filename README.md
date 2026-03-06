@@ -20,4 +20,4 @@
 
 ## 💾 Download
 
-> ### [Download for Windows](https://www.mediafire.com/file/0z6gdga604lcnw8/Bobs-Better-Autoclicker.exe/file)
+> ### [Download for Windows](https://www.mediafire.com/file/b3u3pwo5d5r28sg/Bobs-Better-Autoclicker.exe/file)
