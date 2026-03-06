@@ -327,6 +327,38 @@ fn execute_sequence(steps: &[SequenceStep]) {
 }
 
 // ---------------------------------------------------------------------------
+// Settings persistence
+// ---------------------------------------------------------------------------
+
+/// Returns the path to the settings JSON file.
+/// On Windows: %APPDATA%\BobsBetterAutoclicker\settings.json
+fn settings_path() -> std::path::PathBuf {
+    let dir = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(dir)
+        .join("BobsBetterAutoclicker")
+        .join("settings.json")
+}
+
+/// Serialize `actions` to the settings file. Errors are silently ignored —
+/// the app continues working; settings just won't survive the next restart.
+fn persist_actions(actions: &[Action]) {
+    if let Ok(json) = serde_json::to_string_pretty(actions) {
+        let path = settings_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// Try to load saved actions. Returns `None` if the file doesn't exist or
+/// can't be parsed (e.g. after a breaking schema change).
+fn load_persisted_actions() -> Option<Vec<Action>> {
+    let json = std::fs::read_to_string(settings_path()).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+// ---------------------------------------------------------------------------
 // Scheduler thread
 // ---------------------------------------------------------------------------
 
@@ -527,6 +559,11 @@ fn update_action(
     }
 
     register_hotkeys(&app, &arc);
+
+    // Persist after hotkeys are re-registered (state is fully settled).
+    let snapshot = state.lock().unwrap().actions.clone();
+    persist_actions(&snapshot);
+
     Ok(())
 }
 
@@ -579,6 +616,9 @@ fn add_action(state: tauri::State<SharedState>) -> Action {
     };
     guard.runtime.insert(id, ActionRuntimeState::default());
     guard.actions.push(action.clone());
+    let snapshot = guard.actions.clone();
+    drop(guard); // release lock before I/O
+    persist_actions(&snapshot);
     action
 }
 
@@ -616,6 +656,9 @@ fn remove_action(
         }
     }
     register_hotkeys(&app, &arc);
+
+    let snapshot = state.lock().unwrap().actions.clone();
+    persist_actions(&snapshot);
 
     Ok(())
 }
@@ -660,7 +703,18 @@ async fn capture_cursor_position(app: AppHandle) -> Result<(i32, i32), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let shared_state: SharedState = Arc::new(Mutex::new(AppState::default()));
+    // Restore saved settings, or fall back to built-in defaults.
+    let initial_state = match load_persisted_actions() {
+        Some(actions) => {
+            let mut runtime = HashMap::new();
+            for a in &actions {
+                runtime.insert(a.id.clone(), ActionRuntimeState::default());
+            }
+            AppState { actions, runtime }
+        }
+        None => AppState::default(),
+    };
+    let shared_state: SharedState = Arc::new(Mutex::new(initial_state));
 
     let scheduler_state = Arc::clone(&shared_state);
     std::thread::spawn(move || scheduler_loop(scheduler_state));
