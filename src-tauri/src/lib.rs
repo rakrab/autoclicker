@@ -1,13 +1,14 @@
 use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 // ---------------------------------------------------------------------------
-// Windows API — used for cursor position capture only
+// Windows API — used for cursor position capture and panic-key polling
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
@@ -25,16 +26,30 @@ mod win_api {
 
     pub const VK_LBUTTON: i32 = 0x01;
 
-    pub fn wait_for_left_click(timeout_ms: u64) -> Option<(i32, i32)> {
+    /// Block until a left-click occurs, returning its screen position.
+    /// Returns `None` on timeout or if `cancel` is set to `true`.
+    pub fn wait_for_left_click(
+        timeout_ms: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Option<(i32, i32)> {
+        use std::sync::atomic::Ordering;
         let start = std::time::Instant::now();
 
+        // If a button is already held when we start, wait for it to be released
+        // so we don't immediately capture a leftover press.
         unsafe {
             while (GetAsyncKeyState(VK_LBUTTON) as u16 & 0x8000) != 0 {
+                if cancel.load(Ordering::SeqCst) {
+                    return None;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
 
         loop {
+            if cancel.load(Ordering::SeqCst) {
+                return None;
+            }
             if start.elapsed().as_millis() as u64 > timeout_ms {
                 return None;
             }
@@ -43,6 +58,9 @@ mod win_api {
                     let mut pt = POINT { x: 0, y: 0 };
                     GetCursorPos(&mut pt);
                     while (GetAsyncKeyState(VK_LBUTTON) as u16 & 0x8000) != 0 {
+                        if cancel.load(Ordering::SeqCst) {
+                            return Some((pt.x, pt.y));
+                        }
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     return Some((pt.x, pt.y));
@@ -159,6 +177,13 @@ impl Default for ActionRuntimeState {
 pub struct AppState {
     actions: Vec<Action>,
     runtime: HashMap<String, ActionRuntimeState>,
+    /// Physical key (`KeyboardEvent.code`, e.g. "ShiftRight") that stops every
+    /// running action. Polled directly via the OS so it can never be "claimed"
+    /// by another app and works even for lone modifier keys.
+    panic_hotkey: Option<String>,
+    /// Per-action hotkey registration problems, surfaced in the UI.
+    /// Keyed by action id → human-readable message.
+    hotkey_errors: HashMap<String, String>,
 }
 
 impl Default for AppState {
@@ -193,11 +218,16 @@ impl Default for AppState {
         AppState {
             actions: vec![lmb, rmb],
             runtime,
+            panic_hotkey: Some(DEFAULT_PANIC_HOTKEY.into()),
+            hotkey_errors: HashMap::new(),
         }
     }
 }
 
 pub type SharedState = Arc<Mutex<AppState>>;
+
+/// Default panic key: Right Shift (rarely used in games/macros).
+const DEFAULT_PANIC_HOTKEY: &str = "ShiftRight";
 
 // ---------------------------------------------------------------------------
 // Key string → enigo Key mapping
@@ -243,6 +273,64 @@ fn str_to_key(s: &str) -> Option<Key> {
         }
         _ => None,
     }
+}
+
+/// Map a `KeyboardEvent.code` value (physical key) to a Windows virtual-key
+/// code, for the panic-key polling watcher. Returns `None` for keys we can't
+/// map. Supports lone modifiers (e.g. Right Shift) which global shortcuts can't.
+#[cfg(target_os = "windows")]
+fn code_to_vk(code: &str) -> Option<i32> {
+    Some(match code {
+        "ShiftRight" => 0xA1,
+        "ShiftLeft" => 0xA0,
+        "ControlLeft" => 0xA2,
+        "ControlRight" => 0xA3,
+        "AltLeft" => 0xA4,
+        "AltRight" => 0xA5,
+        "MetaLeft" => 0x5B,
+        "MetaRight" => 0x5C,
+        "Escape" => 0x1B,
+        "Space" => 0x20,
+        "Enter" | "NumpadEnter" => 0x0D,
+        "Tab" => 0x09,
+        "Backspace" => 0x08,
+        "Delete" => 0x2E,
+        "Insert" => 0x2D,
+        "Home" => 0x24,
+        "End" => 0x23,
+        "PageUp" => 0x21,
+        "PageDown" => 0x22,
+        "ArrowUp" => 0x26,
+        "ArrowDown" => 0x28,
+        "ArrowLeft" => 0x25,
+        "ArrowRight" => 0x27,
+        "CapsLock" => 0x14,
+        _ => {
+            if let Some(rest) = code.strip_prefix("Key") {
+                let c = rest.chars().next()?;
+                if c.is_ascii_alphabetic() {
+                    return Some(c.to_ascii_uppercase() as i32);
+                }
+                return None;
+            }
+            if let Some(rest) = code.strip_prefix("Digit") {
+                let c = rest.chars().next()?;
+                if c.is_ascii_digit() {
+                    return Some(c as i32);
+                }
+                return None;
+            }
+            if let Some(rest) = code.strip_prefix('F') {
+                if let Ok(n) = rest.parse::<i32>() {
+                    if (1..=24).contains(&n) {
+                        return Some(0x70 + (n - 1));
+                    }
+                }
+                return None;
+            }
+            return None;
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -314,11 +402,22 @@ fn execute_step_action(enigo: &mut Enigo, action: &SequenceStepAction) {
     }
 }
 
-/// Run every step in order, sleeping `delay_ms` after each one.
-fn execute_sequence(steps: &[SequenceStep]) {
+/// Run every step in order, sleeping `delay_ms` after each one. Bails early if
+/// the action is deactivated mid-run (panic key pressed or toggled off), so a
+/// long sequence can be stopped. Reuses a single Enigo across all steps.
+fn execute_sequence(state: &SharedState, id: &str, steps: &[SequenceStep]) {
+    let mut enigo = Enigo::new(&Settings::default()).ok();
     for step in steps {
-        if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
-            execute_step_action(&mut enigo, &step.action);
+        // Stop immediately if the action is no longer active.
+        {
+            let guard = state.lock().unwrap();
+            match guard.runtime.get(id) {
+                Some(rt) if rt.active => {}
+                _ => return,
+            }
+        }
+        if let Some(e) = enigo.as_mut() {
+            execute_step_action(e, &step.action);
         }
         if step.delay_ms > 0 {
             std::thread::sleep(Duration::from_millis(step.delay_ms));
@@ -330,6 +429,15 @@ fn execute_sequence(steps: &[SequenceStep]) {
 // Settings persistence
 // ---------------------------------------------------------------------------
 
+/// On-disk settings shape. Wraps the action list so we can also persist the
+/// panic hotkey without a bare top-level array.
+#[derive(Serialize, Deserialize)]
+struct PersistedSettings {
+    actions: Vec<Action>,
+    #[serde(default)]
+    panic_hotkey: Option<String>,
+}
+
 /// Returns the path to the settings JSON file.
 /// On Windows: %APPDATA%\BobsBetterAutoclicker\settings.json
 fn settings_path() -> std::path::PathBuf {
@@ -339,10 +447,14 @@ fn settings_path() -> std::path::PathBuf {
         .join("settings.json")
 }
 
-/// Serialize `actions` to the settings file. Errors are silently ignored —
-/// the app continues working; settings just won't survive the next restart.
-fn persist_actions(actions: &[Action]) {
-    if let Ok(json) = serde_json::to_string_pretty(actions) {
+/// Serialize settings to disk. Errors are silently ignored — the app keeps
+/// working; settings just won't survive the next restart.
+fn persist_settings(actions: &[Action], panic_hotkey: &Option<String>) {
+    let data = PersistedSettings {
+        actions: actions.to_vec(),
+        panic_hotkey: panic_hotkey.clone(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&data) {
         let path = settings_path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -351,11 +463,20 @@ fn persist_actions(actions: &[Action]) {
     }
 }
 
-/// Try to load saved actions. Returns `None` if the file doesn't exist or
-/// can't be parsed (e.g. after a breaking schema change).
-fn load_persisted_actions() -> Option<Vec<Action>> {
+/// Try to load saved settings. Returns `None` if the file doesn't exist or
+/// can't be parsed. Handles the legacy format (a bare `[Action, ...]` array),
+/// migrating it to the current shape with the default panic hotkey.
+fn load_persisted_settings() -> Option<(Vec<Action>, Option<String>)> {
     let json = std::fs::read_to_string(settings_path()).ok()?;
-    serde_json::from_str(&json).ok()
+    // Current format: { "actions": [...], "panic_hotkey": "..." }
+    if let Ok(s) = serde_json::from_str::<PersistedSettings>(&json) {
+        return Some((s.actions, s.panic_hotkey));
+    }
+    // Legacy format: bare array of actions (pre panic-hotkey).
+    if let Ok(actions) = serde_json::from_str::<Vec<Action>>(&json) {
+        return Some((actions, Some(DEFAULT_PANIC_HOTKEY.into())));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +485,9 @@ fn load_persisted_actions() -> Option<Vec<Action>> {
 
 fn scheduler_loop(state: SharedState) {
     let tick = Duration::from_millis(2);
+    // Reuse a single Enigo instance across ticks instead of constructing one
+    // for every click — far cheaper at high CPS.
+    let mut enigo = Enigo::new(&Settings::default()).ok();
     loop {
         std::thread::sleep(tick);
 
@@ -418,7 +542,7 @@ fn scheduler_loop(state: SharedState) {
                 ActionType::Sequence { steps } => {
                     let state_clone = Arc::clone(&state);
                     std::thread::spawn(move || {
-                        execute_sequence(&steps);
+                        execute_sequence(&state_clone, &id, &steps);
                         // Mark done and record completion time so interval_ms
                         // is measured from sequence end, not sequence start.
                         let mut guard = state_clone.lock().unwrap();
@@ -429,8 +553,11 @@ fn scheduler_loop(state: SharedState) {
                     });
                 }
                 _ => {
-                    if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
-                        execute_action(&mut enigo, &action_type);
+                    if enigo.is_none() {
+                        enigo = Enigo::new(&Settings::default()).ok();
+                    }
+                    if let Some(e) = enigo.as_mut() {
+                        execute_action(e, &action_type);
                     }
                 }
             }
@@ -439,9 +566,51 @@ fn scheduler_loop(state: SharedState) {
 }
 
 // ---------------------------------------------------------------------------
+// Panic-key watcher thread
+// ---------------------------------------------------------------------------
+
+/// Polls the configured panic key via the OS and, on a fresh press, stops
+/// every running action. Runs independently of the global-shortcut plugin so
+/// it works for lone modifier keys and can't be claimed by another app.
+#[cfg(target_os = "windows")]
+fn panic_watcher_loop(state: SharedState) {
+    let mut was_down = false;
+    loop {
+        std::thread::sleep(Duration::from_millis(15));
+
+        let vk = {
+            let guard = state.lock().unwrap();
+            guard.panic_hotkey.as_deref().and_then(code_to_vk)
+        };
+
+        match vk {
+            Some(vk) => {
+                let down = unsafe { (win_api::GetAsyncKeyState(vk) as u16 & 0x8000) != 0 };
+                // Trigger only on the rising edge (fresh press).
+                if down && !was_down {
+                    let mut guard = state.lock().unwrap();
+                    for rt in guard.runtime.values_mut() {
+                        rt.active = false;
+                        rt.executing = false;
+                    }
+                }
+                was_down = down;
+            }
+            None => was_down = false,
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn panic_watcher_loop(_state: SharedState) {}
+
+// ---------------------------------------------------------------------------
 // Hotkey helpers
 // ---------------------------------------------------------------------------
 
+/// Register every action hotkey with the global-shortcut plugin, recording any
+/// problems (parse failure, already claimed by another app, or duplicate within
+/// this app) into `state.hotkey_errors` for the UI to surface.
 fn register_hotkeys(app: &AppHandle, state: &SharedState) {
     let actions: Vec<(String, String, TriggerMode)> = {
         let guard = state.lock().unwrap();
@@ -458,39 +627,67 @@ fn register_hotkeys(app: &AppHandle, state: &SharedState) {
     };
 
     let manager = app.global_shortcut();
+    let mut errors: HashMap<String, String> = HashMap::new();
+    // Normalized hotkey string → id of the action that claimed it first.
+    let mut seen: HashMap<String, String> = HashMap::new();
 
     for (id, hotkey_str, mode) in actions {
-        if let Ok(shortcut) = hotkey_str.parse::<Shortcut>() {
-            let state_clone = Arc::clone(state);
-            let id_clone = id.clone();
-            let _ = manager.on_shortcut(shortcut, move |_app, _shortcut, event| {
-                let mut guard = state_clone.lock().unwrap();
-                let rt = guard
-                    .runtime
-                    .entry(id_clone.clone())
-                    .or_insert_with(ActionRuntimeState::default);
-                match mode {
-                    TriggerMode::Toggle => {
-                        if event.state == ShortcutState::Pressed {
-                            rt.active = !rt.active;
-                            if rt.active {
-                                rt.last_execution = None;
+        let key_norm = hotkey_str.to_lowercase();
+
+        if seen.contains_key(&key_norm) {
+            errors.insert(
+                id.clone(),
+                "Duplicate — this hotkey is already used by another action".into(),
+            );
+            continue;
+        }
+
+        match hotkey_str.parse::<Shortcut>() {
+            Ok(shortcut) => {
+                let state_clone = Arc::clone(state);
+                let id_clone = id.clone();
+                let result = manager.on_shortcut(shortcut, move |_app, _shortcut, event| {
+                    let mut guard = state_clone.lock().unwrap();
+                    let rt = guard
+                        .runtime
+                        .entry(id_clone.clone())
+                        .or_insert_with(ActionRuntimeState::default);
+                    match mode {
+                        TriggerMode::Toggle => {
+                            if event.state == ShortcutState::Pressed {
+                                rt.active = !rt.active;
+                                if rt.active {
+                                    rt.last_execution = None;
+                                }
                             }
                         }
+                        TriggerMode::Hold => match event.state {
+                            ShortcutState::Pressed => {
+                                rt.active = true;
+                                rt.last_execution = None;
+                            }
+                            ShortcutState::Released => {
+                                rt.active = false;
+                            }
+                        },
                     }
-                    TriggerMode::Hold => match event.state {
-                        ShortcutState::Pressed => {
-                            rt.active = true;
-                            rt.last_execution = None;
-                        }
-                        ShortcutState::Released => {
-                            rt.active = false;
-                        }
-                    },
+                });
+                match result {
+                    Ok(_) => {
+                        seen.insert(key_norm, id.clone());
+                    }
+                    Err(_) => {
+                        errors.insert(id.clone(), "This hotkey is claimed by another app".into());
+                    }
                 }
-            });
+            }
+            Err(_) => {
+                errors.insert(id.clone(), "Failed to parse hotkey".into());
+            }
         }
     }
+
+    state.lock().unwrap().hotkey_errors = errors;
 }
 
 fn unregister_all_hotkeys(app: &AppHandle, state: &SharedState) {
@@ -515,6 +712,13 @@ fn unregister_all_hotkeys(app: &AppHandle, state: &SharedState) {
 // Tauri commands
 // ---------------------------------------------------------------------------
 
+/// Combined status poll: per-action active flags + hotkey registration errors.
+#[derive(Serialize)]
+struct StatusReport {
+    active: HashMap<String, bool>,
+    hotkey_errors: HashMap<String, String>,
+}
+
 #[tauri::command]
 fn get_actions(state: tauri::State<SharedState>) -> Vec<Action> {
     state.lock().unwrap().actions.clone()
@@ -528,15 +732,9 @@ fn update_action(
 ) -> Result<(), String> {
     let arc = Arc::clone(&*state);
 
-    let old_hotkeys: Vec<String> = {
-        let guard = state.lock().unwrap();
-        guard
-            .actions
-            .iter()
-            .filter_map(|a| a.hotkey.clone())
-            .filter(|hk| !hk.is_empty())
-            .collect()
-    };
+    // Unregister the currently-bound hotkeys BEFORE mutating, so a changed or
+    // cleared hotkey doesn't leave its old binding stale.
+    unregister_all_hotkeys(&app, &arc);
 
     {
         let mut guard = state.lock().unwrap();
@@ -551,18 +749,15 @@ fn update_action(
             .or_insert_with(ActionRuntimeState::default);
     }
 
-    let manager = app.global_shortcut();
-    for hk in old_hotkeys {
-        if let Ok(shortcut) = hk.parse::<Shortcut>() {
-            let _ = manager.unregister(shortcut);
-        }
-    }
-
+    // Re-register from the updated state, recomputing registration errors.
     register_hotkeys(&app, &arc);
 
     // Persist after hotkeys are re-registered (state is fully settled).
-    let snapshot = state.lock().unwrap().actions.clone();
-    persist_actions(&snapshot);
+    let (snapshot, panic) = {
+        let g = state.lock().unwrap();
+        (g.actions.clone(), g.panic_hotkey.clone())
+    };
+    persist_settings(&snapshot, &panic);
 
     Ok(())
 }
@@ -586,13 +781,36 @@ fn set_action_active(
 }
 
 #[tauri::command]
-fn get_action_active(state: tauri::State<SharedState>, id: String) -> bool {
+fn get_status(state: tauri::State<SharedState>) -> StatusReport {
     let guard = state.lock().unwrap();
-    guard
+    let active = guard
         .runtime
-        .get(&id)
-        .map(|rt| rt.active)
-        .unwrap_or(false)
+        .iter()
+        .map(|(k, v)| (k.clone(), v.active))
+        .collect();
+    StatusReport {
+        active,
+        hotkey_errors: guard.hotkey_errors.clone(),
+    }
+}
+
+#[tauri::command]
+fn get_panic_hotkey(state: tauri::State<SharedState>) -> Option<String> {
+    state.lock().unwrap().panic_hotkey.clone()
+}
+
+#[tauri::command]
+fn set_panic_hotkey(
+    state: tauri::State<SharedState>,
+    hotkey: Option<String>,
+) -> Result<(), String> {
+    let (snapshot, panic) = {
+        let mut guard = state.lock().unwrap();
+        guard.panic_hotkey = hotkey.filter(|h| !h.is_empty());
+        (guard.actions.clone(), guard.panic_hotkey.clone())
+    };
+    persist_settings(&snapshot, &panic);
+    Ok(())
 }
 
 #[tauri::command]
@@ -617,8 +835,9 @@ fn add_action(state: tauri::State<SharedState>) -> Action {
     guard.runtime.insert(id, ActionRuntimeState::default());
     guard.actions.push(action.clone());
     let snapshot = guard.actions.clone();
+    let panic = guard.panic_hotkey.clone();
     drop(guard); // release lock before I/O
-    persist_actions(&snapshot);
+    persist_settings(&snapshot, &panic);
     action
 }
 
@@ -633,15 +852,8 @@ fn remove_action(
     }
     let arc = Arc::clone(&*state);
 
-    let old_hotkeys: Vec<String> = {
-        let guard = state.lock().unwrap();
-        guard
-            .actions
-            .iter()
-            .filter_map(|a| a.hotkey.clone())
-            .filter(|hk| !hk.is_empty())
-            .collect()
-    };
+    // Unregister current hotkeys (including the removed action's) before mutating.
+    unregister_all_hotkeys(&app, &arc);
 
     {
         let mut guard = state.lock().unwrap();
@@ -649,16 +861,13 @@ fn remove_action(
         guard.runtime.remove(&id);
     }
 
-    let manager = app.global_shortcut();
-    for hk in old_hotkeys {
-        if let Ok(shortcut) = hk.parse::<Shortcut>() {
-            let _ = manager.unregister(shortcut);
-        }
-    }
     register_hotkeys(&app, &arc);
 
-    let snapshot = state.lock().unwrap().actions.clone();
-    persist_actions(&snapshot);
+    let (snapshot, panic) = {
+        let g = state.lock().unwrap();
+        (g.actions.clone(), g.panic_hotkey.clone())
+    };
+    persist_settings(&snapshot, &panic);
 
     Ok(())
 }
@@ -668,33 +877,49 @@ fn remove_action(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-async fn capture_cursor_position(app: AppHandle) -> Result<(i32, i32), String> {
+async fn capture_cursor_position(
+    app: AppHandle,
+    cancel: tauri::State<'_, Arc<AtomicBool>>,
+) -> Result<(i32, i32), String> {
+    let cancel_flag = Arc::clone(&cancel);
+    cancel_flag.store(false, Ordering::SeqCst);
+
     if let Some(win) = app.get_webview_window("main") {
         win.minimize().map_err(|e| e.to_string())?;
     }
 
-    let pos = tauri::async_runtime::spawn_blocking(move || -> Result<(i32, i32), String> {
+    let capture_flag = Arc::clone(&cancel_flag);
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<(i32, i32), String> {
         std::thread::sleep(Duration::from_millis(400));
 
         #[cfg(target_os = "windows")]
         {
-            win_api::wait_for_left_click(20_000)
-                .ok_or_else(|| "Capture timed out".to_string())
+            win_api::wait_for_left_click(20_000, &capture_flag)
+                .ok_or_else(|| "Capture cancelled or timed out".to_string())
         }
         #[cfg(not(target_os = "windows"))]
         {
+            let _ = &capture_flag;
             Err("Position capture is only supported on Windows".into())
         }
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| e.to_string());
 
+    // Always restore the window, whether capture succeeded, timed out, or was
+    // cancelled — otherwise the app is left minimized.
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.unminimize();
         let _ = win.set_focus();
     }
 
-    Ok(pos)
+    result?
+}
+
+/// Abort an in-flight `capture_cursor_position` call.
+#[tauri::command]
+fn cancel_position_capture(cancel: tauri::State<Arc<AtomicBool>>) {
+    cancel.store(true, Ordering::SeqCst);
 }
 
 // ---------------------------------------------------------------------------
@@ -704,31 +929,53 @@ async fn capture_cursor_position(app: AppHandle) -> Result<(i32, i32), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Restore saved settings, or fall back to built-in defaults.
-    let initial_state = match load_persisted_actions() {
-        Some(actions) => {
+    let initial_state = match load_persisted_settings() {
+        Some((actions, panic_hotkey)) => {
             let mut runtime = HashMap::new();
             for a in &actions {
                 runtime.insert(a.id.clone(), ActionRuntimeState::default());
             }
-            AppState { actions, runtime }
+            AppState {
+                actions,
+                runtime,
+                panic_hotkey,
+                hotkey_errors: HashMap::new(),
+            }
         }
         None => AppState::default(),
     };
     let shared_state: SharedState = Arc::new(Mutex::new(initial_state));
+    let capture_cancel: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
     let scheduler_state = Arc::clone(&shared_state);
     std::thread::spawn(move || scheduler_loop(scheduler_state));
+
+    let watcher_state = Arc::clone(&shared_state);
+    std::thread::spawn(move || panic_watcher_loop(watcher_state));
+
+    let setup_state = Arc::clone(&shared_state);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(shared_state)
+        .manage(capture_cancel)
+        .setup(move |app| {
+            // Register saved hotkeys immediately so they work on launch —
+            // previously they only became active after being rebound once.
+            let handle = app.handle().clone();
+            register_hotkeys(&handle, &setup_state);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_actions,
             update_action,
             set_action_active,
-            get_action_active,
+            get_status,
+            get_panic_hotkey,
+            set_panic_hotkey,
             capture_cursor_position,
+            cancel_position_capture,
             add_action,
             remove_action,
         ])

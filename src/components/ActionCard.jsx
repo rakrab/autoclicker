@@ -93,26 +93,35 @@ function normalizeSingleKey(e) {
 }
 
 // ─── Position capture countdown helper ───────────────────────────────────────
-// Returns a thunk that does the capture with a 3-2-1 countdown.
+// Does the capture with a 3-2-1 countdown, then waits for a click.
 // `setCountdown` receives null | 3 | 2 | 1 during the countdown.
 // `setCapturing` is set true while the Tauri call is in flight.
-async function runCaptureWithCountdown(setCountdown, setCapturing, onSuccess) {
-  setCountdown(3);
-  await new Promise(r => setTimeout(r, 1000));
-  setCountdown(2);
-  await new Promise(r => setTimeout(r, 1000));
-  setCountdown(1);
-  await new Promise(r => setTimeout(r, 1000));
+// `cancelRef` is a ref whose `.current` flips to true to abort at any stage.
+async function runCaptureWithCountdown(setCountdown, setCapturing, onSuccess, cancelRef) {
+  cancelRef.current = false;
+  for (const n of [3, 2, 1]) {
+    setCountdown(n);
+    await new Promise(r => setTimeout(r, 1000));
+    if (cancelRef.current) { setCountdown(null); return; }
+  }
   setCountdown(null);
   setCapturing(true);
   try {
     const [x, y] = await invoke("capture_cursor_position");
-    onSuccess(x, y);
+    if (!cancelRef.current) onSuccess(x, y);
   } catch (err) {
-    console.error("capture_cursor_position:", err);
+    if (!cancelRef.current) console.error("capture_cursor_position:", err);
   } finally {
     setCapturing(false);
   }
+}
+
+// Abort an in-flight capture (countdown or waiting-for-click).
+function cancelCapture(cancelRef, setCountdown, setCapturing) {
+  cancelRef.current = true;
+  invoke("cancel_position_capture").catch(() => {});
+  setCountdown(null);
+  setCapturing(false);
 }
 
 // ─── Reusable primitives ──────────────────────────────────────────────────────
@@ -391,15 +400,29 @@ function Dot() {
   return <span style={{ display: "inline-block", flexShrink: 0, width: 3, height: 3, borderRadius: "50%", background: "rgba(237,237,250,0.18)" }} />;
 }
 
-function KeyBadge({ children }) {
+function KeyBadge({ children, error = false }) {
   return (
     <span style={{
-      background: "rgba(124,58,237,0.18)", color: T.accentLight,
+      background: error ? "rgba(239,68,68,0.15)" : "rgba(124,58,237,0.18)",
+      color: error ? "rgba(248,113,113,0.95)" : T.accentLight,
       padding: "2px 8px", borderRadius: 5,
-      border: "1px solid rgba(124,58,237,0.28)",
+      border: `1px solid ${error ? "rgba(239,68,68,0.35)" : "rgba(124,58,237,0.28)"}`,
       fontSize: 12, letterSpacing: "0.05em", fontFamily: T.mono,
     }}>
       {children}
+    </span>
+  );
+}
+
+// Small warning glyph shown next to a hotkey that failed to register.
+function HotkeyWarn({ title }) {
+  return (
+    <span title={title} style={{ display: "inline-flex", alignItems: "center", cursor: "help" }}>
+      <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+        <path d="M7 1L13 12H1L7 1Z" stroke="rgba(248,113,113,0.9)" strokeWidth="1.3" strokeLinejoin="round" />
+        <line x1="7" y1="5.5" x2="7" y2="8.5" stroke="rgba(248,113,113,0.9)" strokeWidth="1.3" strokeLinecap="round" />
+        <circle cx="7" cy="10.3" r="0.75" fill="rgba(248,113,113,0.9)" />
+      </svg>
     </span>
   );
 }
@@ -423,6 +446,7 @@ function SequenceStepRow({ step, index, totalSteps, onChange, onRemove, onMoveUp
 
   const stepRef     = useRef(step);
   const onChangeRef = useRef(onChange);
+  const captureCancelRef = useRef(false);
   useEffect(() => { stepRef.current = step; }, [step]);
   useEffect(() => { onChangeRef.current = onChange; }, [onChange]);
 
@@ -487,13 +511,16 @@ function SequenceStepRow({ step, index, totalSteps, onChange, onRemove, onMoveUp
 
   const handleCapturePos = (e) => {
     e.stopPropagation();
-    if (capturingPos || captureCountdown !== null) return;
+    if (capturingPos || captureCountdown !== null) {
+      cancelCapture(captureCancelRef, setCaptureCountdown, setCapturingPos);
+      return;
+    }
     runCaptureWithCountdown(setCaptureCountdown, setCapturingPos, (x, y) => {
       onChangeRef.current({
         ...stepRef.current,
         action: { ...stepRef.current.action, position: { type: "fixed", x, y } },
       });
-    });
+    }, captureCancelRef);
   };
 
   const isFixed = sa.type === "mouse_click" && sa.position?.type === "fixed";
@@ -594,15 +621,15 @@ function SequenceStepRow({ step, index, totalSteps, onChange, onRemove, onMoveUp
                   />
                 </div>
               ))}
-              <HkButton small onClick={handleCapturePos} variant={capturingPos ? "warn" : "accent"}>
-                {capturingPos ? "Capturing…" : "Capture"}
+              <HkButton small onClick={handleCapturePos} variant={(capturingPos || captureCountdown !== null) ? "warn" : "accent"}>
+                {capturingPos ? "Cancel" : captureCountdown !== null ? "Cancel" : "Capture"}
               </HkButton>
             </div>
           )}
           <CountdownBanner countdown={captureCountdown} />
           {capturingPos && (
             <p style={{ fontSize: 11, color: "rgba(250,204,21,0.65)", lineHeight: 1.6 }}>
-              Click anywhere on screen to set the position. (20s timeout)
+              Click anywhere on screen to set the position, or press Cancel. (20s timeout)
             </p>
           )}
         </div>
@@ -696,7 +723,7 @@ function StepCtrlBtn({ children, onClick, disabled, danger, title }) {
 }
 
 // ─── Main ActionCard component ────────────────────────────────────────────────
-export default function ActionCard({ action: initialAction, isActive, onActiveChange, onRemove }) {
+export default function ActionCard({ action: initialAction, isActive, hotkeyError, onActiveChange, onRemove }) {
   const [action, setAction] = useState(initialAction);
   const [isOpen, setIsOpen] = useState(false);
 
@@ -714,6 +741,7 @@ export default function ActionCard({ action: initialAction, isActive, onActiveCh
   const [liveComboKeys,     setLiveComboKeys]     = useState(null);
 
   const actionRef = useRef(action);
+  const captureCancelRef = useRef(false);
   useEffect(() => { actionRef.current = action; }, [action]);
   useEffect(() => { setAction(initialAction); }, [initialAction]);
 
@@ -765,13 +793,16 @@ export default function ActionCard({ action: initialAction, isActive, onActiveCh
   // ── Position capture (with countdown) ────────────────────────────────────
   const handleCapturePosition = (e) => {
     e.stopPropagation();
-    if (capturingPos || captureCountdown !== null) return;
+    if (capturingPos || captureCountdown !== null) {
+      cancelCapture(captureCancelRef, setCaptureCountdown, setCapturingPos);
+      return;
+    }
     runCaptureWithCountdown(setCaptureCountdown, setCapturingPos, (x, y) => {
       pushUpdate({
         ...actionRef.current,
         action_type: { ...actionRef.current.action_type, position: { type: "fixed", x, y } },
       });
-    });
+    }, captureCancelRef);
   };
 
   // ── Hotkey capture ──────────────────────────────────────────────────────────
@@ -943,7 +974,8 @@ export default function ActionCard({ action: initialAction, isActive, onActiveCh
             <span>{intervalStr}</span>
             <Dot />
             <span>{modeStr}</span>
-            {action.hotkey && (<><Dot /><KeyBadge>{action.hotkey.toUpperCase()}</KeyBadge></>)}
+            {action.hotkey && (<><Dot /><KeyBadge error={!!hotkeyError}>{action.hotkey.toUpperCase()}</KeyBadge></>)}
+            {action.hotkey && hotkeyError && <HotkeyWarn title={hotkeyError} />}
           </div>
         </div>
 
@@ -1173,16 +1205,16 @@ export default function ActionCard({ action: initialAction, isActive, onActiveCh
                             />
                           </div>
                         ))}
-                        <HkButton onClick={handleCapturePosition} variant={capturingPos ? "warn" : "accent"}>
+                        <HkButton onClick={handleCapturePosition} variant={(capturingPos || captureCountdown !== null) ? "warn" : "accent"}>
                           {capturingPos ? (
                             <span style={{ display: "flex", alignItems: "center", gap: 7 }}>
                               <span style={{ width: 8, height: 8, borderRadius: "50%", background: "currentColor", animation: "pulse 1s ease-in-out infinite" }} />
-                              Waiting for click…
+                              Waiting… (cancel)
                             </span>
                           ) : captureCountdown !== null ? (
                             <span style={{ display: "flex", alignItems: "center", gap: 7 }}>
                               <span style={{ fontFamily: T.mono, fontWeight: 700 }}>{captureCountdown}</span>
-                              Minimizing…
+                              Cancel
                             </span>
                           ) : (
                             <span style={{ display: "flex", alignItems: "center", gap: 7 }}>
@@ -1202,7 +1234,7 @@ export default function ActionCard({ action: initialAction, isActive, onActiveCh
                       <CountdownBanner countdown={captureCountdown} />
                       {capturingPos && (
                         <p style={{ marginTop: 10, fontSize: 12, color: "rgba(250,204,21,0.7)", lineHeight: 1.6 }}>
-                          Click anywhere on screen to set the position. (20s timeout)
+                          Click anywhere on screen to set the position, or press Cancel. (20s timeout)
                         </p>
                       )}
                     </div>
@@ -1266,6 +1298,19 @@ export default function ActionCard({ action: initialAction, isActive, onActiveCh
                   <p style={{ marginTop: 9, fontSize: 12, color: T.text3, lineHeight: 1.6 }}>
                     Hold modifiers (Ctrl, Shift, Alt) then press a key. Release to confirm. Esc cancels.
                   </p>
+                )}
+                {!capturing && action.hotkey && hotkeyError && (
+                  <div style={{
+                    marginTop: 10, padding: "8px 12px", borderRadius: 8,
+                    background: "rgba(239,68,68,0.08)",
+                    border: "1px solid rgba(239,68,68,0.25)",
+                    display: "flex", alignItems: "center", gap: 8,
+                  }}>
+                    <HotkeyWarn title={hotkeyError} />
+                    <span style={{ fontSize: 12, color: "rgba(248,113,113,0.9)", lineHeight: 1.5 }}>
+                      {hotkeyError}
+                    </span>
+                  </div>
                 )}
               </div>
 
